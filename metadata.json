@@ -1,0 +1,6 @@
+{
+  "name": "Instructor Python Grading Hub",
+  "description": "Bulk IPYNB grading system for university faculty. Analyze multiple student submissions simultaneously with AI-powered feedback.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
