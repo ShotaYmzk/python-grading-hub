@@ -15,32 +15,33 @@ import {
   Check,
   User,
   Trash2,
-  Users
+  Users,
+  RotateCw
 } from 'lucide-react';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import { ReportMarkdown } from './components/ReportMarkdown';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { ASSIGNMENT_TASKS } from './constants';
 import { gradeSubmission } from './services/geminiService';
-import { getStoredApiKey } from './lib/apiKey';
+import { getStoredApiKeys } from './lib/apiKey';
+import { ApiKeyPool } from './lib/apiKeyPool';
 import { ApiKeySettings } from './components/ApiKeySettings';
+import { ModelSettings } from './components/ModelSettings';
+import { getStoredGradingModel } from './lib/gradingModel';
+import { formatGradingError } from './lib/formatGradingError';
+import {
+  loadSubmissions,
+  saveSubmissions,
+  clearSubmissions,
+  forceRewriteAllStoredReports,
+  type StudentSubmission,
+} from './lib/submissionStorage';
 
 /**
  * Utility for tailwind class merging
  */
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
-}
-
-interface StudentSubmission {
-  id: string;
-  studentName: string;
-  sourceCode: string;
-  filename: string;
-  report: string | null;
-  status: 'idle' | 'grading' | 'done' | 'error';
-  error: string | null;
 }
 
 const parseIpynb = async (file: File): Promise<string> => {
@@ -62,19 +63,52 @@ const parseIpynb = async (file: File): Promise<string> => {
 export default function App() {
   const [selectedTaskId, setSelectedTaskId] = useState(ASSIGNMENT_TASKS[0].id);
   // Store submissions mapped by taskId
-  const [submissionsByTask, setSubmissionsByTask] = useState<Record<string, StudentSubmission[]>>({});
+  const [submissionsByTask, setSubmissionsByTask] = useState<Record<string, StudentSubmission[]>>(
+    () => loadSubmissions()
+  );
   const [isBulkGrading, setIsBulkGrading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
-  const [apiKey, setApiKey] = useState<string | null>(null);
+  const [apiKeys, setApiKeys] = useState<string[]>([]);
   const [showApiKeyPrompt, setShowApiKeyPrompt] = useState(false);
+  const [gradingModelId, setGradingModelId] = useState(getStoredGradingModel);
+  const keyPoolRef = useRef<ApiKeyPool | null>(null);
+
+  const BULK_GRADE_DELAY_MS = 6000;
 
   useEffect(() => {
-    setApiKey(getStoredApiKey());
+    const keys = getStoredApiKeys();
+    setApiKeys(keys);
+    keyPoolRef.current = keys.length > 0 ? new ApiKeyPool(keys) : null;
   }, []);
 
+  useEffect(() => {
+    saveSubmissions(submissionsByTask);
+  }, [submissionsByTask]);
+
+  const handleClearLocalData = () => {
+    if (!confirm('このブラウザに保存した提出・採点データをすべて削除しますか？')) return;
+    clearSubmissions();
+    setSubmissionsByTask({});
+  };
+
+  const handleRewriteStoredReports = () => {
+    const count = forceRewriteAllStoredReports();
+    setSubmissionsByTask(loadSubmissions());
+    alert(
+      count > 0
+        ? `保存済みレポート ${count} 件を読みやすい形式に書き換えました。`
+        : '変更はありませんでした。ページを再読み込みして表示を確認してください。'
+    );
+  };
+
+  const syncApiKeys = (keys: string[]) => {
+    setApiKeys(keys);
+    keyPoolRef.current = keys.length > 0 ? new ApiKeyPool(keys) : null;
+  };
+
   const requireApiKey = (): boolean => {
-    if (apiKey) return true;
+    if (apiKeys.length > 0) return true;
     setShowApiKeyPrompt(true);
     return false;
   };
@@ -86,10 +120,23 @@ export default function App() {
     const files = Array.from(e.target.files || []);
     if (files.length === 0) return;
 
+    const existingFilenames = new Set(
+      (submissionsByTask[selectedTaskId] || []).map((s) => s.filename.toLowerCase())
+    );
+    const addedInBatch = new Set<string>();
+    const skipped: string[] = [];
     const newSubmissions: StudentSubmission[] = [];
+
     for (const file of files) {
+      const normalizedName = file.name.toLowerCase();
+      if (existingFilenames.has(normalizedName) || addedInBatch.has(normalizedName)) {
+        skipped.push(file.name);
+        continue;
+      }
+
       try {
         const sourceCode = await parseIpynb(file);
+        addedInBatch.add(normalizedName);
         newSubmissions.push({
           id: Math.random().toString(36).substr(2, 9),
           studentName: file.name.replace('.ipynb', ''),
@@ -103,16 +150,27 @@ export default function App() {
         alert(`${file.name}: ${err.message}`);
       }
     }
-    
-    setSubmissionsByTask(prev => ({
-      ...prev,
-      [selectedTaskId]: [...(prev[selectedTaskId] || []), ...newSubmissions]
-    }));
-    
+
+    if (skipped.length > 0) {
+      alert(
+        `${selectedTask.title} に同じファイル名が既にあるため、次をスキップしました:\n\n${skipped.join('\n')}`
+      );
+    }
+
+    if (newSubmissions.length > 0) {
+      setSubmissionsByTask((prev) => ({
+        ...prev,
+        [selectedTaskId]: [...(prev[selectedTaskId] || []), ...newSubmissions],
+      }));
+    }
+
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
-  const gradeOne = async (taskId: string, subId: string, source: string, key: string) => {
+  const gradeOne = async (taskId: string, subId: string, source: string) => {
+    const pool = keyPoolRef.current;
+    if (!pool) return;
+
     setSubmissionsByTask(prev => ({
       ...prev,
       [taskId]: prev[taskId].map(s => s.id === subId ? { ...s, status: 'grading', error: null } : s)
@@ -120,7 +178,8 @@ export default function App() {
     
     try {
       const result = await gradeSubmission(
-        key,
+        pool,
+        gradingModelId,
         taskId,
         ASSIGNMENT_TASKS.find(t => t.id === taskId)!.title,
         ASSIGNMENT_TASKS.find(t => t.id === taskId)!.description,
@@ -138,14 +197,26 @@ export default function App() {
     }
   };
 
+  const handleGradeSubmission = async (subId: string, source: string) => {
+    if (!requireApiKey() || !keyPoolRef.current) return;
+    if (isBulkGrading) return;
+    const sub = currentSubmissions.find((s) => s.id === subId);
+    if (sub?.status === 'grading') return;
+    await gradeOne(selectedTaskId, subId, source);
+  };
+
   const handleBulkGrade = async () => {
-    if (!requireApiKey() || !apiKey) return;
+    if (!requireApiKey() || !keyPoolRef.current) return;
     setIsBulkGrading(true);
     const taskSubmissions = [...currentSubmissions];
     
-    for (const sub of taskSubmissions) {
+    for (let i = 0; i < taskSubmissions.length; i++) {
+      const sub = taskSubmissions[i];
       if (sub.status !== 'done') {
-        await gradeOne(selectedTaskId, sub.id, sub.sourceCode, apiKey);
+        await gradeOne(selectedTaskId, sub.id, sub.sourceCode);
+        if (i < taskSubmissions.length - 1) {
+          await new Promise((r) => setTimeout(r, BULK_GRADE_DELAY_MS));
+        }
       }
     }
     setIsBulkGrading(false);
@@ -184,12 +255,15 @@ export default function App() {
           <p className="text-sm font-mono mt-4 font-bold opacity-60">Python Data Science Course Management</p>
         </div>
         <div className="mt-8 md:mt-0 flex flex-col items-start md:items-end gap-3">
-          <ApiKeySettings
-            apiKey={apiKey}
-            onApiKeyChange={setApiKey}
-            forceOpen={showApiKeyPrompt}
-            onForceOpenHandled={() => setShowApiKeyPrompt(false)}
-          />
+          <div className="flex flex-wrap gap-2 justify-end">
+            <ModelSettings modelId={gradingModelId} onModelChange={setGradingModelId} />
+            <ApiKeySettings
+              apiKeys={apiKeys}
+              onApiKeysChange={syncApiKeys}
+              forceOpen={showApiKeyPrompt}
+              onForceOpenHandled={() => setShowApiKeyPrompt(false)}
+            />
+          </div>
           <div className="flex flex-col items-start md:items-end gap-1 text-[10px] font-mono font-bold uppercase tracking-widest opacity-40">
             <span>Active Session: {selectedTask.title}</span>
             <span>Pending in this Task: {currentSubmissions.filter(s => s.status !== 'done').length}</span>
@@ -244,13 +318,30 @@ export default function App() {
             </div>
           </section>
 
-          <footer className="p-6 mt-auto">
+          <footer className="p-6 mt-auto space-y-3">
             <div className="p-4 border-[1px] border-dashed border-[#111111]/20 bg-gray-50">
               <p className="text-[9px] font-mono opacity-60 font-bold leading-tight">
                 VIEW FILTER ACTIVE<br/>
                 選択中の回に関するデータのみが表示されます。他の回のデータは内部的に保持されています。
               </p>
+              <p className="text-[9px] font-mono opacity-60 font-bold leading-tight mt-2">
+                提出・採点結果はこのブラウザの localStorage に自動保存されます。
+              </p>
             </div>
+            <button
+              type="button"
+              onClick={handleRewriteStoredReports}
+              className="w-full py-2 border-[1px] border-[#111111]/30 text-[9px] font-black uppercase tracking-widest hover:bg-blue-50 transition-colors"
+            >
+              保存レポートを整形して書き換え
+            </button>
+            <button
+              type="button"
+              onClick={handleClearLocalData}
+              className="w-full py-2 border-[1px] border-[#111111]/30 text-[9px] font-black uppercase tracking-widest text-red-600 hover:bg-red-50 transition-colors"
+            >
+              ローカルデータをすべて削除
+            </button>
           </footer>
         </div>
 
@@ -333,9 +424,27 @@ export default function App() {
                               <p className="text-[9px] font-mono opacity-50 uppercase tracking-widest">{sub.filename}</p>
                            </div>
                         </div>
-                        <div className="flex items-center gap-4">
+                        <div className="flex items-center gap-2 flex-wrap justify-end">
+                           {sub.status !== 'grading' && (
+                             <button
+                               type="button"
+                               onClick={() => handleGradeSubmission(sub.id, sub.sourceCode)}
+                               disabled={isBulkGrading}
+                               className={cn(
+                                 "px-3 py-1.5 border-[2px] border-[#111111] text-[10px] font-black uppercase tracking-widest flex items-center gap-2 transition-all bg-white",
+                                 sub.status === 'error'
+                                   ? "text-red-600 hover:bg-red-600 hover:text-white shadow-[2px_2px_0px_#11111122]"
+                                   : "hover:bg-[#111111] hover:text-white",
+                                 isBulkGrading && "opacity-30 cursor-not-allowed"
+                               )}
+                             >
+                               <RotateCw className="w-3 h-3" />
+                               {sub.status === 'idle' ? '採点' : '再評価'}
+                             </button>
+                           )}
                            {sub.status === 'done' && (
                              <button
+                               type="button"
                                onClick={() => sub.report && copyToClipboard(sub.report, sub.id)}
                                className="px-3 py-1.5 border-[1px] border-[#111111] text-[10px] font-black uppercase tracking-widest flex items-center gap-2 hover:bg-black hover:text-white transition-all bg-white"
                              >
@@ -344,9 +453,10 @@ export default function App() {
                              </button>
                            )}
                            <button
+                             type="button"
                              onClick={() => removeSubmission(sub.id)}
-                             disabled={isBulkGrading && sub.status === 'grading'}
-                             className="p-1.5 text-red-600 hover:bg-red-50 transition-colors"
+                             disabled={sub.status === 'grading' || isBulkGrading}
+                             className="p-1.5 text-red-600 hover:bg-red-50 transition-colors disabled:opacity-30"
                            >
                              <Trash2 className="w-4 h-4" />
                            </button>
@@ -368,29 +478,19 @@ export default function App() {
                           </div>
                         )}
                         {sub.status === 'error' && (
-                          <div className="p-4 bg-red-50 border border-red-200 text-red-600 text-[10px] font-mono flex items-center gap-2">
-                             <AlertTriangle className="w-4 h-4" />
-                             Error: {sub.error}
+                          <div className="space-y-3">
+                            <div className="p-4 bg-red-50 border border-red-200 text-red-600 text-[10px] font-mono flex items-start gap-2">
+                               <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                               <span>{formatGradingError(sub.error)}</span>
+                            </div>
+                            <p className="text-[9px] font-mono opacity-50">
+                              右上の「再評価」でこの提出だけ採点し直せます。
+                            </p>
                           </div>
                         )}
                         {sub.status === 'done' && sub.report && (
                           <div className="markdown-report-container animate-in fade-in slide-in-from-top-2 duration-500">
-                             <article className="prose prose-sm max-w-none 
-                               prose-p:text-[#111111]/80 prose-p:font-medium 
-                               prose-headings:text-[#111111] prose-headings:font-black prose-headings:uppercase prose-headings:tracking-[-0.03em]
-                               prose-h2:text-2xl prose-h2:mb-6 prose-h2:mt-10 prose-h2:border-b-2 prose-h2:border-[#111111] prose-h2:pb-1
-                               prose-h3:text-[11px] prose-h3:mt-8 prose-h3:mb-3 prose-h3:tracking-[0.2em] prose-h3:bg-[#111111] prose-h3:text-white prose-h3:p-1 prose-h3:inline-block
-                               
-                               prose-table:border-[2px] prose-table:border-[#111111] prose-table:w-full prose-table:my-8
-                               prose-th:bg-gray-100 prose-th:text-[#111111] prose-th:font-black prose-th:text-[10px] prose-th:uppercase prose-th:tracking-widest prose-th:py-3 prose-th:px-4 prose-th:border-[1px] prose-th:border-[#111111] prose-th:text-left
-                               prose-td:py-3 prose-td:px-4 prose-td:border-[1px] prose-td:border-[#111111] prose-td:text-[12px] prose-td:leading-relaxed
-                               
-                               prose-strong:font-black prose-strong:text-[#111111]
-                               prose-code:text-[#111111] prose-code:bg-blue-50 prose-code:px-1 prose-code:font-bold prose-code:before:content-none prose-code:after:content-none
-                               prose-pre:bg-[#111111] prose-pre:text-[#FDFDFC] prose-pre:rounded-none prose-pre:p-4 prose-pre:font-mono
-                               ">
-                               <ReactMarkdown remarkPlugins={[remarkGfm]}>{sub.report}</ReactMarkdown>
-                             </article>
+                            <ReportMarkdown content={sub.report} />
                           </div>
                         )}
                      </div>
